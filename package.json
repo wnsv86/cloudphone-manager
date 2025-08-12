@@ -1,0 +1,29 @@
+{
+  "name": "cloudphone-manager",
+  "version": "0.1.0",
+  "description": "Cloud phone manager - Electron prototype",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win --x64"
+  },
+  "author": "Generated",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^27.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "dependencies": {
+    "lowdb": "^6.0.1",
+    "mkdirp": "^1.0.4"
+  },
+  "build": {
+    "appId": "com.example.cloudphone",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": ["nsis"]
+    }
+  }
+}

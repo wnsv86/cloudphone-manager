@@ -1,0 +1,7 @@
+body { font-family: Arial, sans-serif; margin: 12px; }
+#controls { margin-bottom: 8px; }
+.entry { border: 1px solid #ddd; padding: 8px; margin-bottom: 6px; border-radius: 6px; }
+.row { display:flex; justify-content:space-between; align-items:center; }
+.title { font-weight:600; }
+.actions button { margin-left:6px; }
+.meta { color:#666; font-size:12px; margin-top:6px; }

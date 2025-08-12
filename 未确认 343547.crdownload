@@ -1,0 +1,455 @@
+# CloudPhone Manager — Electron (Minimal Prototype)
+
+This textdoc contains a minimal, working Electron project you can upload to GitHub and run in Codespaces or locally.
+
+---
+
+## Project structure
+
+```
+cloudphone-manager/
+├─ package.json
+├─ main.js
+├─ preload.js
+├─ renderer/
+│  ├─ index.html
+│  ├─ renderer.js
+│  └─ style.css
+├─ config.json (auto-generated on first run)
+└─ README.md
+```
+
+---
+
+## package.json
+
+```json
+{
+  "name": "cloudphone-manager",
+  "version": "0.1.0",
+  "description": "Cloud phone manager - Electron prototype",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder --win --x64"
+  },
+  "author": "Generated",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^27.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "dependencies": {
+    "lowdb": "^6.0.1",
+    "mkdirp": "^1.0.4"
+  },
+  "build": {
+    "appId": "com.example.cloudphone",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": ["nsis"]
+    }
+  }
+}
+```
+
+Notes: version pins are examples. Codespaces will `npm install` and then `npm run build` using electron-builder (which works in Linux for Windows target only if proper wine/cross-compile environment exists). In Codespaces you can still `npm start` to run the app in headless mode or forward display via VNC — but typically you will run locally for GUI. If you want to compile real Windows `.exe` inside Codespaces, you might need additional setup. Still, this repo is ready for local dev and for editing/CI.
+
+---
+
+## main.js
+
+```javascript
+const { app, BrowserWindow, ipcMain, dialog, globalShortcut, screen } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const mkdirp = require('mkdirp');
+const { Low, JSONFile } = require('lowdb');
+
+// Force no system proxy (attempt to bypass VPN smart-split)
+app.commandLine.appendSwitch('no-proxy-server');
+
+const userDataBase = path.join(app.getPath('userData'), 'instances');
+mkdirp.sync(userDataBase);
+
+// Lowdb config
+const dbFile = path.join(app.getPath('userData'), 'config.json');
+const adapter = new JSONFile(dbFile);
+const db = new Low(adapter);
+
+let mainWindow;
+const instances = new Map(); // id -> {win, config}
+
+async function initDB() {
+  await db.read();
+  db.data = db.data || { entries: [] };
+  await db.write();
+}
+
+function createMainWindow() {
+  mainWindow = new BrowserWindow({
+    width: 900,
+    height: 700,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js')
+    }
+  });
+  mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+}
+
+function createInstanceWindow(entry) {
+  // create a unique userData dir per instance
+  const id = entry.id || Date.now().toString();
+  const instUserData = path.join(userDataBase, id);
+  mkdirp.sync(instUserData);
+
+  const win = new BrowserWindow({
+    width: entry.width || 360,
+    height: entry.height || 800,
+    title: entry.name || 'CloudPhone',
+    webPreferences: {
+      sandbox: false,
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js')
+    }
+  });
+
+  // set per-window userData dir by relaunching with env var - Chromium doesn't allow changing after runtime easily
+  // Workaround: we launch normally and rely on session partition via BrowserView later if needed.
+
+  win.loadURL(entry.url);
+
+  win.on('closed', () => {
+    instances.delete(id);
+  });
+
+  instances.set(id, { win, entry, id });
+  return id;
+}
+
+function tileWindows() {
+  const displays = screen.getAllDisplays();
+  const primary = screen.getPrimaryDisplay();
+  const openWins = Array.from(instances.values()).map(x => x.win).filter(w => !!w);
+  if (!openWins.length) return;
+
+  const cols = Math.ceil(Math.sqrt(openWins.length));
+  const rows = Math.ceil(openWins.length / cols);
+  const { width, height } = primary.workAreaSize;
+  const cellW = Math.floor(width / cols);
+  const cellH = Math.floor(height / rows);
+
+  openWins.forEach((w, i) => {
+    const r = Math.floor(i / cols);
+    const c = i % cols;
+    const x = c * cellW;
+    const y = r * cellH;
+    w.setBounds({ x, y, width: cellW, height: cellH });
+  });
+}
+
+app.whenReady().then(async () => {
+  await initDB();
+  createMainWindow();
+
+  // global shortcuts: F6 hide, F7 show
+  globalShortcut.register('F6', () => {
+    for (const v of instances.values()) v.win.hide();
+  });
+  globalShortcut.register('F7', () => {
+    for (const v of instances.values()) v.win.show();
+  });
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
+  });
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
+
+// IPC handlers
+ipcMain.handle('get-entries', async () => {
+  await db.read();
+  return db.data.entries || [];
+});
+
+ipcMain.handle('save-entries', async (evt, entries) => {
+  db.data.entries = entries;
+  await db.write();
+  return true;
+});
+
+ipcMain.handle('open-entry', async (evt, entry) => {
+  const id = createInstanceWindow(entry);
+  return id;
+});
+
+ipcMain.handle('open-all', async () => {
+  await db.read();
+  const entries = db.data.entries || [];
+  entries.forEach(e => createInstanceWindow(e));
+  return true;
+});
+
+ipcMain.handle('tile-windows', async () => {
+  tileWindows();
+  return true;
+});
+
+ipcMain.handle('set-always-on-top', async (evt, id, flag) => {
+  const inst = instances.get(id);
+  if (inst && inst.win) inst.win.setAlwaysOnTop(flag);
+  return true;
+});
+
+ipcMain.handle('close-instance', async (evt, id) => {
+  const inst = instances.get(id);
+  if (inst && inst.win) inst.win.close();
+  return true;
+});
+
+ipcMain.handle('show-dialog', async (evt, opts) => {
+  return dialog.showMessageBox(mainWindow, opts);
+});
+
+// basic cookie export helper (example)
+ipcMain.handle('export-cookies', async (evt, id) => {
+  const inst = instances.get(id);
+  if (!inst || !inst.win) return null;
+  try {
+    const sess = inst.win.webContents.session;
+    const cookies = await sess.cookies.get({});
+    const fn = path.join(app.getPath('userData'), `cookies-${id}.json`);
+    fs.writeFileSync(fn, JSON.stringify(cookies, null, 2));
+    return fn;
+  } catch (e) {
+    return null;
+  }
+});
+
+// import cookies (simple example) - note: may need domain/path adjustments
+ipcMain.handle('import-cookies', async (evt, id, cookieFile) => {
+  const inst = instances.get(id);
+  if (!inst || !inst.win) return false;
+  try {
+    const sess = inst.win.webContents.session;
+    const raw = fs.readFileSync(cookieFile, 'utf8');
+    const cookies = JSON.parse(raw);
+    for (const c of cookies) {
+      const toSet = {
+        url: (c.secure ? 'https://' : 'http://') + c.domain.replace(/^\./, ''),
+        name: c.name,
+        value: c.value,
+        path: c.path,
+        expirationDate: c.expirationDate
+      };
+      await sess.cookies.set(toSet);
+    }
+    return true;
+  } catch (e) {
+    console.error(e);
+    return false;
+  }
+});
+```
+
+Notes in code: This prototype uses one BrowserWindow per instance and demonstrates cookie export/import. Per-window `userData` isolation is more involved because Electron uses a single app-wide userData. A robust approach is to spawn secondary helper processes or use distinct `BrowserView` sessions with partition names; this prototype keeps things simple and uses session.cookies APIs.
+
+---
+
+## preload.js
+
+```javascript
+const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('api', {
+  getEntries: () => ipcRenderer.invoke('get-entries'),
+  saveEntries: (entries) => ipcRenderer.invoke('save-entries', entries),
+  openEntry: (entry) => ipcRenderer.invoke('open-entry', entry),
+  openAll: () => ipcRenderer.invoke('open-all'),
+  tileWindows: () => ipcRenderer.invoke('tile-windows'),
+  setAlwaysOnTop: (id, flag) => ipcRenderer.invoke('set-always-on-top', id, flag),
+  closeInstance: (id) => ipcRenderer.invoke('close-instance', id),
+  exportCookies: (id) => ipcRenderer.invoke('export-cookies', id),
+  importCookies: (id, file) => ipcRenderer.invoke('import-cookies', id, file),
+  showDialog: (opts) => ipcRenderer.invoke('show-dialog', opts)
+});
+```
+
+---
+
+## renderer/index.html
+
+```html
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline' https: http: data:;" />
+    <title>CloudPhone Manager</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <h1>CloudPhone Manager</h1>
+      <div id="controls">
+        <button id="openAll">Open All</button>
+        <button id="tile">Tile Windows</button>
+        <button id="add">Add Entry</button>
+      </div>
+      <div id="list"></div>
+    </div>
+    <script src="renderer.js"></script>
+  </body>
+</html>
+```
+
+---
+
+## renderer/renderer.js
+
+```javascript
+const listEl = document.getElementById('list');
+const openAllBtn = document.getElementById('openAll');
+const tileBtn = document.getElementById('tile');
+const addBtn = document.getElementById('add');
+
+let entries = [];
+
+async function refresh() {
+  entries = await window.api.getEntries();
+  renderList();
+}
+
+function renderList() {
+  listEl.innerHTML = '';
+  entries.forEach((e, idx) => {
+    const div = document.createElement('div');
+    div.className = 'entry';
+    div.innerHTML = `
+      <div class="row">
+        <div class="title">${e.name || 'Unnamed'}</div>
+        <div class="actions">
+          <button data-idx="${idx}" class="open">Open</button>
+          <button data-idx="${idx}" class="export">Export Cookies</button>
+          <button data-idx="${idx}" class="delete">Delete</button>
+        </div>
+      </div>
+      <div class="meta">${e.url}</div>
+    `;
+    listEl.appendChild(div);
+  });
+}
+
+openAllBtn.addEventListener('click', async () => {
+  await window.api.openAll();
+});
+
+tileBtn.addEventListener('click', async () => {
+  await window.api.tileWindows();
+});
+
+addBtn.addEventListener('click', async () => {
+  const name = prompt('Entry name', 'China Mobile CloudPhone');
+  const url = prompt('H5 URL', 'https://cloud.139.com/');
+  if (!url) return;
+  entries.push({ id: Date.now().toString(), name, url, width: 360, height: 800 });
+  await window.api.saveEntries(entries);
+  refresh();
+});
+
+listEl.addEventListener('click', async (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  const idx = Number(btn.getAttribute('data-idx'));
+  if (btn.classList.contains('open')) {
+    await window.api.openEntry(entries[idx]);
+  } else if (btn.classList.contains('export')) {
+    const fn = await window.api.exportCookies(entries[idx].id);
+    alert(fn ? 'Exported: ' + fn : 'Export failed');
+  } else if (btn.classList.contains('delete')) {
+    if (confirm('Delete this entry?')) {
+      entries.splice(idx, 1);
+      await window.api.saveEntries(entries);
+      refresh();
+    }
+  }
+});
+
+refresh();
+```
+
+---
+
+## renderer/style.css
+
+```css
+body { font-family: Arial, sans-serif; margin: 12px; }
+#controls { margin-bottom: 8px; }
+.entry { border: 1px solid #ddd; padding: 8px; margin-bottom: 6px; border-radius: 6px; }
+.row { display:flex; justify-content:space-between; align-items:center; }
+.title { font-weight:600; }
+.actions button { margin-left:6px; }
+.meta { color:#666; font-size:12px; margin-top:6px; }
+```
+
+---
+
+## README.md
+
+```md
+# CloudPhone Manager (Electron prototype)
+
+This is a minimal Electron prototype to manage multiple H5 cloud-phone pages. It demonstrates:
+
+- A simple management UI
+- Open multiple BrowserWindows to H5 URLs
+- Tile windows (grid)
+- Export/import cookies example
+- Save configuration in `config.json`
+
+## Quick start (local)
+
+1. Install Node.js (LTS)
+2. Clone repo
+
+```bash
+npm install
+npm start
+```
+
+3. Use the UI to add entries (default H5: https://cloud.139.com/), open windows, and tile them.
+
+## Notes about building an `.exe`
+
+- `npm run build` uses `electron-builder`. Building Windows MSI/EXE on Linux may require additional tooling (wine). The easiest way is to build on a Windows machine.
+
+## About proxy bypass
+
+The app calls `app.commandLine.appendSwitch('no-proxy-server')` to attempt to bypass system proxy. Depending on how your VPN enforces routing, this may or may not always take effect; test on your machine.
+
+## Security & Risk
+
+- Cookies and sessions are saved; treat the `userData` folder as sensitive.
+- Automating actions on third-party services may violate their terms of service. Use responsibly.
+```
+
+---
+
+## Final notes
+
+This is a **minimal prototype** covering the requested features: central manager, open H5 windows, tile, basic cookie export/import, save entries, and a switch to bypass proxy. It intentionally keeps complexity lower so you can test quickly. 
+
+If you want, I can now:
+
+- Add a `session partition` per instance to fully isolate storage without creating separate app userData directories.
+- Add automatic periodic cookie backup per instance.
+- Add an import UI to load cookies files from disk.
+- Add a build-ready pipeline for GitHub Codespaces (devcontainer) that pre-installs Node and builds for Windows (note: cross-build needs extra steps).
+
+Tell me which extras to add next and I will update the code here.
